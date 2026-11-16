@@ -18,9 +18,9 @@ const SELECTORS = {
   cookieDecline: 'button:has-text("Decline optional cookies"), button:has-text("Only allow essential cookies")',
   
   // Login
-  loginUsername: 'input[name="username"], input[aria-label*="username"], input[aria-label*="Phone"], input[autocomplete="username"]',
-  loginPassword: 'input[name="password"], input[type="password"], input[aria-label*="Password"]',
-  loginButton: 'button[type="submit"], button:has-text("Log in"), div[role="button"]:has-text("Log in")',
+  loginUsername: 'input[name="username"], input[name="email"], input[aria-label*="username"], input[aria-label*="Phone"], input[aria-label*="Mobile"], input[autocomplete="username"]',
+  loginPassword: 'input[name="password"], input[name="pass"], input[type="password"], input[aria-label*="Password"]',
+  loginButton: 'button[type="submit"], input[type="submit"], button:has-text("Log in"), div[role="button"]:has-text("Log in")',
   loginError: '#slfErrorAlert, p[data-testid="login-error-message"]',
   notNowButton: 'button:has-text("Not Now"), div[role="button"]:has-text("Not now")',
   saveLoginButton: 'button:has-text("Save Info"), button:has-text("Save info")',
@@ -71,28 +71,99 @@ const SELECTORS = {
   postLink: 'a[href*="/p/"]',
 };
 
+type InstagramInboxThread = {
+  id: string;
+  title: string;
+  username: string;
+  avatar: string | null;
+  preview: string;
+  updated_at: string | null;
+  messages: Array<{
+    id: string;
+    text: string;
+    image: string | null;
+    sent_at: string | null;
+    from_me: boolean;
+  }>;
+};
+
 export class InstagramHandler extends BasePlatformHandler {
   private readonly baseUrl = 'https://www.instagram.com';
+  private inboxThreads = new Map<string, InstagramInboxThread>();
+  /** Uma página Playwright — inbox, login e envio não podem correr juntos. */
+  private pageGate: Promise<void> = Promise.resolve();
 
   constructor(browserManager: BrowserManager, rateLimiter: RateLimiter) {
     super('instagram', browserManager, rateLimiter);
+  }
+
+  private async withPageLock<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.pageGate;
+    this.pageGate = previous.then(() => next);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * The saved browser session is the login. The feed icons change with the
+   * language and the current Instagram layout, so they are only a backup.
+   */
+  private async instagramSessionCookie(): Promise<boolean> {
+    const page = await this.getPage();
+    const cookies = await page.context().cookies('https://www.instagram.com');
+    return cookies.some((cookie) => cookie.name === 'sessionid' && cookie.value);
   }
 
   /**
    * Check if logged in to Instagram
    */
   async isLoggedIn(): Promise<boolean> {
+    return this.withPageLock(() => this.isLoggedInUnlocked());
+  }
+
+  private async isLoggedInUnlocked(): Promise<boolean> {
     try {
+      const page = await this.getPage();
+      const hasSession = await this.instagramSessionCookie();
+      const current = page.url();
+      const alreadyOnSite =
+        current.startsWith(this.baseUrl) &&
+        !/\/accounts\/(login|suspended)|\/challenge\//.test(current);
+      if (hasSession && alreadyOnSite) {
+        const hasLoginForm = await this.elementExists(SELECTORS.loginUsername);
+        if (!hasLoginForm) return true;
+      }
+
       await this.navigate(`${this.baseUrl}/`);
       await this.delay();
-      
-      // Check for logged-in indicators
-      const hasShared = await this.elementExists(SELECTORS.loggedInShared);
-      const hasProfileIcon = await this.elementExists(SELECTORS.profileIcon);
 
-      console.debug('Login check - hasShared:', hasShared, 'hasProfileIcon:', hasProfileIcon);
-      
-      return hasShared && hasProfileIcon;
+      const url = page.url();
+      const onLoginWall = /\/accounts\/(login|suspended)|\/challenge\//.test(url);
+      const hasLoginForm = await this.elementExists(SELECTORS.loginUsername);
+      const hasNav = await this.elementExists(
+        [
+          'svg[aria-label="Home"]',
+          'svg[aria-label="Início"]',
+          'svg[aria-label="Página inicial"]',
+          'a[href="/direct/inbox/"]',
+          'svg[aria-label="Messenger"]',
+          'svg[aria-label="Mensagens"]',
+          'svg[aria-label="New post"]',
+          'svg[aria-label="Nova publicação"]',
+        ].join(', '),
+      );
+
+      log.info('Instagram login check', { url, onLoginWall, hasSession, hasLoginForm, hasNav });
+      if (onLoginWall || hasLoginForm) return false;
+      return hasSession || hasNav;
     } catch (error) {
       log.error('Error checking Instagram login status', { error: String(error) });
       return false;
@@ -105,32 +176,41 @@ export class InstagramHandler extends BasePlatformHandler {
   async login(): Promise<boolean> {
     try {
       log.info('Starting Instagram login...');
-      
-      await this.navigate(`${this.baseUrl}/accounts/login/`);
-      await this.delay();
 
-      // Check if already logged in
       if (await this.isLoggedIn()) {
         log.info('Already logged in to Instagram');
+        await this.browserManager.saveSession('instagram');
         return true;
       }
 
-      // Wait for login form
+      await this.navigate(`${this.baseUrl}/accounts/login/`);
+      await this.delay();
+      await this.handleCookieConsent();
+
       const hasLoginForm = await this.waitForElement(SELECTORS.loginUsername, 15000);
+      if (!hasLoginForm && await this.isLoggedIn()) {
+        log.info('Already logged in to Instagram');
+        await this.browserManager.saveSession('instagram');
+        return true;
+      }
       if (!hasLoginForm) {
-        log.error('Login form not found');
+        const page = await this.getPage();
+        log.error('Login form not found', { url: page.url() });
         return false;
       }
 
       log.info('Instagram login form ready. Please enter credentials manually in the browser.');
       log.info('Waiting for login to complete...');
 
-      // Wait for successful login (up to 2 minutes for manual input)
+      // Wait for successful login. Do not navigate away while the form is open.
       const startTime = Date.now();
-      const timeout = 120000;
+      const timeout = 180000;
 
       while (Date.now() - startTime < timeout) {
-        if (await this.isLoggedIn()) {
+        const page = await this.getPage();
+        const stillOnLogin = page.url().includes('/accounts/login');
+        const hasSession = stillOnLogin ? false : await this.instagramSessionCookie();
+        if (hasSession) {
           log.info('Instagram login successful');
           await this.browserManager.saveSession('instagram');
           
@@ -250,8 +330,10 @@ export class InstagramHandler extends BasePlatformHandler {
       // Try multiple selectors for the username field
       const usernameSelectors = [
         'input[name="username"]',
-        'input[aria-label*="username"]', 
+        'input[name="email"]',
+        'input[aria-label*="username"]',
         'input[aria-label*="Phone"]',
+        'input[aria-label*="Mobile"]',
         'input[aria-label*="email"]',
         'input[autocomplete="username"]',
         'input[type="text"]',
@@ -279,7 +361,7 @@ export class InstagramHandler extends BasePlatformHandler {
       log.info('Username entered');
 
       // Find and enter password
-      const passwordSelectors = ['input[name="password"]', 'input[type="password"]', 'input[aria-label*="Password"]'];
+      const passwordSelectors = ['input[name="password"]', 'input[name="pass"]', 'input[type="password"]', 'input[aria-label*="Password"]'];
       let passwordField = null;
       for (const sel of passwordSelectors) {
         if (await this.elementExists(sel)) {
@@ -305,7 +387,7 @@ export class InstagramHandler extends BasePlatformHandler {
       log.info('Screenshot saved before clicking login');
 
       // Click login button
-      const loginSelectors = ['button[type="submit"]', 'button:has-text("Log in")', 'div[role="button"]:has-text("Log in")'];
+      const loginSelectors = ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Log in")', 'div[role="button"]:has-text("Log in")'];
       for (const sel of loginSelectors) {
         if (await this.elementExists(sel)) {
           log.info(`Clicking login button: ${sel}`);
@@ -645,6 +727,299 @@ export class InstagramHandler extends BasePlatformHandler {
       log.error('Error unfollowing Instagram user', { error: String(error) });
       return this.createErrorResult('unfollow', payload.username, String(error), startTime, status);
     }
+  }
+
+  private directTime(value: unknown): string | null {
+    const raw = Number(value);
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    const millis = raw > 1e14 ? raw / 1000 : raw > 1e12 ? raw : raw * 1000;
+    const date = new Date(millis);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+
+  private httpsUrl(value: unknown): string | null {
+    const url = String(value || '');
+    return url.startsWith('https://') ? url.slice(0, 2000) : null;
+  }
+
+  private messageImage(content: {
+    __typename?: string;
+    xma?: {
+      preview_image?: { url?: string };
+      xmaPreviewImage?: { url?: string };
+      title_text?: string | null;
+      caption_body_text?: string | null;
+    };
+    image_attachments?: Array<{
+      attachment_cdn_url?: string;
+      preview_url?: string;
+      url?: string;
+    }>;
+    video_attachments?: Array<{
+      preview_url?: string;
+      thumbnail_url?: string;
+    }>;
+  } | null | undefined): string | null {
+    if (!content) return null;
+    const fromXma =
+      this.httpsUrl(content.xma?.preview_image?.url) ||
+      this.httpsUrl(content.xma?.xmaPreviewImage?.url);
+    if (fromXma) return fromXma;
+    const photo = content.image_attachments?.[0];
+    const fromPhoto =
+      this.httpsUrl(photo?.attachment_cdn_url) ||
+      this.httpsUrl(photo?.preview_url) ||
+      this.httpsUrl(photo?.url);
+    if (fromPhoto) return fromPhoto;
+    const video = content.video_attachments?.[0];
+    return this.httpsUrl(video?.preview_url) || this.httpsUrl(video?.thumbnail_url);
+  }
+
+  private mapDirectThread(thread: {
+    thread_fbid?: string;
+    thread_title?: string;
+    last_activity_timestamp_ms?: string;
+    users?: Array<{ username?: string; full_name?: string; profile_pic_url?: string }>;
+    viewer?: { interop_messaging_user_fbid?: string };
+    slide_messages?: {
+      edges?: Array<{
+        node?: {
+          id?: string;
+          message_id?: string;
+          text_body?: string;
+          content_type?: string;
+          timestamp_ms?: string;
+          sender_fbid?: string;
+          content?: Parameters<InstagramHandler['messageImage']>[0] & {
+            xma?: {
+              title_text?: string | null;
+              caption_body_text?: string | null;
+              preview_image?: { url?: string };
+              xmaPreviewImage?: { url?: string };
+            };
+          };
+        };
+      }>;
+    };
+  }): InstagramInboxThread | null {
+    const id = String(thread.thread_fbid || '');
+    if (!/^\d+$/.test(id)) return null;
+    const first = thread.users?.[0] || {};
+    const viewer = String(thread.viewer?.interop_messaging_user_fbid || '');
+    const messages = (thread.slide_messages?.edges || []).map((edge) => {
+      const node = edge.node || {};
+      const written = String(node.text_body || '').trim();
+      const kind = String(node.content_type || '').toLowerCase();
+      const image = this.messageImage(node.content);
+      const shareTitle = String(
+        node.content?.xma?.title_text || node.content?.xma?.caption_body_text || '',
+      ).trim();
+      let text = written.slice(0, 500);
+      if (!text && shareTitle) text = shareTitle.slice(0, 500);
+      if (!text) {
+        if (image || kind.includes('image') || kind.includes('photo')) text = 'Foto';
+        else if (kind.includes('audio') || kind.includes('voice')) text = 'Áudio';
+        else if (kind.includes('video') || kind.includes('reel') || kind.includes('clip') || kind.includes('montage')) text = 'Vídeo';
+        else if (kind.includes('share') || kind.includes('xma')) text = 'Publicação';
+        else text = 'Mensagem';
+      }
+      return {
+        id: String(node.message_id || node.id || ''),
+        text,
+        image,
+        sent_at: this.directTime(node.timestamp_ms),
+        from_me: Boolean(viewer) && String(node.sender_fbid || '') === viewer,
+      };
+    }).filter((message) => message.id);
+    messages.sort((a, b) => (a.sent_at || '').localeCompare(b.sent_at || ''));
+    const username = String(first.username || '');
+    const picture = String(first.profile_pic_url || '');
+    const avatar = picture.startsWith('https://') ? picture.slice(0, 2000) : null;
+    return {
+      id,
+      title: String(thread.thread_title || first.full_name || username || 'Conversa'),
+      username,
+      avatar,
+      preview: messages.at(-1)?.text || '',
+      updated_at: this.directTime(thread.last_activity_timestamp_ms),
+      messages,
+    };
+  }
+
+  async listInbox(): Promise<{ threads: Array<Omit<InstagramInboxThread, 'messages'>> }> {
+    return this.withPageLock(() => this.listInboxUnlocked());
+  }
+
+  private async listInboxUnlocked(): Promise<{ threads: Array<Omit<InstagramInboxThread, 'messages'>> }> {
+    const page = await this.getPage();
+    const found = new Map<string, InstagramInboxThread>();
+    const seen = new Set<string>();
+    const onResponse = async (response: {
+      url: () => string;
+      request: () => { postData: () => string | null; headers: () => Record<string, string> };
+      json: () => Promise<unknown>;
+    }) => {
+      let body = '';
+      let header = '';
+      try {
+        body = response.request().postData() || '';
+        header = response.request().headers()['x-fb-friendly-name'] || '';
+      } catch {
+        return;
+      }
+      const url = response.url();
+      if (url.includes('graphql')) {
+        const named = header || decodeURIComponent((body.match(/fb_api_req_friendly_name=([^&]+)/) || [])[1] || '');
+        if (named) seen.add(named.slice(0, 80));
+      }
+      const haystack = `${url}\n${header}\n${body}`;
+      if (!haystack.includes('IGDThreadDetailQuery') && !haystack.includes('29620840297508799')) return;
+      const json = await response.json().catch(() => null) as {
+        data?: { get_slide_thread_nullable?: { as_ig_direct_thread?: Parameters<InstagramHandler['mapDirectThread']>[0] } };
+      } | null;
+      const thread = json?.data?.get_slide_thread_nullable?.as_ig_direct_thread;
+      if (!thread) return;
+      const mapped = this.mapDirectThread(thread);
+      if (mapped) found.set(mapped.id, mapped);
+    };
+    page.on('response', onResponse);
+    try {
+      await this.navigate(`${this.baseUrl}/direct/inbox/`);
+      await page.waitForTimeout(6000);
+      if (found.size === 0) {
+        log.warn('Instagram inbox had no threads, reloading', { graphql: [...seen] });
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(6000);
+      }
+    } finally {
+      page.off('response', onResponse);
+    }
+    if (found.size === 0) {
+      log.warn('Instagram inbox still empty', { graphql: [...seen], url: page.url() });
+      throw new Error('A caixa de entrada do Instagram não devolveu conversas');
+    }
+    for (const thread of found.values()) this.inboxThreads.set(thread.id, thread);
+    const threads = [...found.values()]
+      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))
+      .map(({ messages: _messages, ...summary }) => summary);
+    return { threads };
+  }
+
+  async listThread(threadId: string): Promise<InstagramInboxThread> {
+    if (!/^\d+$/.test(threadId)) throw new Error('Conversa inválida');
+    if (!this.inboxThreads.has(threadId)) await this.listInbox();
+    const thread = this.inboxThreads.get(threadId);
+    if (!thread) throw new Error('Conversa não encontrada');
+    return thread;
+  }
+
+  private async openThread(threadId: string): Promise<void> {
+    const page = await this.getPage();
+    const threadUrl = `${this.baseUrl}/direct/t/${threadId}/`;
+    const onThread = () => page.url().includes(`/direct/t/${threadId}`);
+
+    await this.navigate(threadUrl);
+    await page.waitForTimeout(1500);
+    if (onThread()) return;
+
+    if (!page.url().includes('/direct/')) {
+      await this.navigate(`${this.baseUrl}/direct/inbox/`);
+      await page.waitForTimeout(1500);
+    }
+
+    const link = page.locator(`a[href*="/direct/t/${threadId}"]`).first();
+    if ((await link.count()) > 0) {
+      await link.click({ timeout: 8000 });
+      await page.waitForTimeout(1500);
+      if (onThread()) return;
+    }
+
+    await page.goto(threadUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+    if (!onThread()) {
+      log.warn('Instagram thread URL did not stick', { wanted: threadUrl, url: page.url() });
+      throw new Error('Não foi possível abrir a conversa no Instagram');
+    }
+  }
+
+  async reply(threadId: string, message: string): Promise<{
+    id: string;
+    text: string;
+    sent_at: string;
+    from_me: true;
+  }> {
+    if (!/^\d+$/.test(threadId)) throw new Error('Conversa inválida');
+    const text = message.trim().slice(0, 1000);
+    if (!text) throw new Error('Escreva uma mensagem');
+    const { allowed } = await this.checkAndRecordAction('dm');
+    if (!allowed) {
+      throw new Error('Limite de mensagens do Instagram atingido. Tente de novo mais tarde.');
+    }
+
+    return this.withPageLock(async () => {
+      const page = await this.getPage();
+      await this.openThread(threadId);
+
+      const composer =
+        'div[contenteditable="true"][role="textbox"]:not([aria-label*="Pesquis" i]):not([aria-label*="Search" i]), textarea[placeholder*="Mensagem" i], textarea[placeholder*="Message" i]';
+      const box = page.locator(composer).last();
+      const appeared = await box
+        .waitFor({ timeout: 15000 })
+        .then(() => true)
+        .catch(async () => {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+          await page.waitForTimeout(1500);
+          if (!page.url().includes(`/direct/t/${threadId}`)) {
+            await this.openThread(threadId);
+          }
+          return box.waitFor({ timeout: 10000 }).then(() => true).catch(() => false);
+        });
+      if (!appeared) {
+        log.warn('Instagram composer missing', { url: page.url(), threadId });
+        throw new Error('Campo de mensagem do Instagram não apareceu');
+      }
+
+      await box.click({ timeout: 5000 });
+      await page.keyboard.insertText(text);
+      let written = ((await box.innerText().catch(() => '')) || '').trim();
+      if (!written) {
+        await box.pressSequentially(text, { delay: 15 });
+        written = ((await box.innerText().catch(() => '')) || '').trim();
+      }
+      if (!written) throw new Error('O Instagram não aceitou o texto');
+
+      const send = page.locator('[aria-label="Enviar"], [aria-label="Send"]').last();
+      if (await send.waitFor({ timeout: 4000 }).then(() => true).catch(() => false)) {
+        await send.click({ timeout: 5000 });
+      } else {
+        await page.keyboard.press('Enter');
+      }
+      await page.waitForTimeout(800);
+      const left = await box.innerText().catch(() => '');
+      if ((left || '').includes(text)) {
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(800);
+      }
+      const stillThere = ((await box.innerText().catch(() => '')) || '').includes(text);
+      if (stillThere) throw new Error('O Instagram não enviou a mensagem');
+      await this.recordAction('dm');
+
+      const sent = {
+        id: `local-${Date.now()}`,
+        text,
+        image: null,
+        sent_at: new Date().toISOString(),
+        from_me: true as const,
+      };
+      const cached = this.inboxThreads.get(threadId);
+      if (cached) {
+        cached.messages.push(sent);
+        cached.preview = text;
+        cached.updated_at = sent.sent_at;
+      }
+      log.info('Sent Instagram reply', { threadId });
+      return sent;
+    });
   }
 
   /**

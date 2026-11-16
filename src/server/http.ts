@@ -32,6 +32,39 @@ export function createHttpServer(socialCrabs: SocialCrabs, apiKey?: string) {
     next();
   });
 
+  // Home page (no auth required)
+  app.get('/', (_req: Request, res: Response) => {
+    res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SocialCrabs</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1419; color: #e7ecf1; }
+    main { max-width: 640px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    p { color: #9aa7b5; line-height: 1.5; }
+    a { color: #7dcea0; }
+    ul { padding-left: 18px; }
+    li { margin: 8px 0; }
+    code { background: #1c242c; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>SocialCrabs</h1>
+    <p>Server is running. This app has no dashboard. Use the API or the CLI.</p>
+    <ul>
+      <li><a href="/health">/health</a> — liveness check</li>
+      <li><a href="/api/status">/api/status</a> — browser and session status</li>
+    </ul>
+    <p>CLI example: <code>node dist/cli.js session status</code></p>
+  </main>
+</body>
+</html>`);
+  });
+
   // Health check (no auth required)
   app.get('/health', (_req: Request, res: Response) => {
     res.json({ status: 'ok', timestamp: Date.now() });
@@ -152,6 +185,39 @@ export function createHttpServer(socialCrabs: SocialCrabs, apiKey?: string) {
       res.json(result);
     } catch (error) {
       log.error('Error unfollowing Instagram user', { error: String(error) });
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.get('/api/instagram/inbox', async (_req: Request, res: Response) => {
+    try {
+      const inbox = await socialCrabs.instagram.listInbox();
+      res.json(inbox);
+    } catch (error) {
+      log.error('Error reading Instagram inbox', { error: String(error) });
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.get('/api/instagram/thread/:threadId', async (req: Request, res: Response) => {
+    try {
+      const threadId = req.params.threadId as string;
+      const thread = await socialCrabs.instagram.listThread(threadId);
+      res.json(thread);
+    } catch (error) {
+      log.error('Error reading Instagram thread', { error: String(error) });
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.post('/api/instagram/thread/:threadId/message', async (req: Request, res: Response) => {
+    try {
+      const threadId = req.params.threadId as string;
+      const message = typeof req.body?.message === 'string' ? req.body.message : '';
+      const sent = await socialCrabs.instagram.reply(threadId, message);
+      res.json(sent);
+    } catch (error) {
+      log.error('Error sending Instagram reply', { error: String(error) });
       res.status(500).json({ error: String(error) });
     }
   });

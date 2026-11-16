@@ -40,15 +40,21 @@ const SELECTORS = {
   followButton: 'button:has-text("Follow"):not(:has-text("Following"))',
   unfollowButton: 'button:has-text("Following")',
   unfollowConfirm: 'button:has-text("Unfollow")',
-  messageButton: 'div[role="button"]:has-text("Message")',
+  messageButton:
+    'div[role="button"]:has-text("Message"), div[role="button"]:has-text("Mensagem"), a[href*="/direct/t/"]',
   
   // DM
-  dmInput: 'textarea[placeholder*="Message"], div[contenteditable="true"][aria-label*="Message"]',
-  dmSendButton: 'button[type="submit"] svg, div[role="button"]:has-text("Send")',
-  newMessageButton: 'svg[aria-label="New message"]',
-  searchUserInput: 'input[placeholder*="Search"]',
-  userResult: 'div[role="button"] span',
-  nextButton: 'div[role="button"]:has-text("Next")',
+  dmInput:
+    'textarea[placeholder*="Message"], textarea[placeholder*="Mensagem"], div[contenteditable="true"][aria-label*="Message"], div[contenteditable="true"][aria-label*="Mensagem"], div[role="textbox"][contenteditable="true"]',
+  dmSendButton:
+    'button[type="submit"], div[role="button"]:has-text("Send"), div[role="button"]:has-text("Enviar")',
+  newMessageButton:
+    'svg[aria-label="New message"], svg[aria-label="Nova mensagem"]',
+  searchUserInput:
+    'input[placeholder*="Search"], input[placeholder*="Pesquisar"], input[name="queryBox"]',
+  userResult: 'div[role="button"] span, div[role="none"] span',
+  nextButton:
+    'div[role="button"]:has-text("Next"), div[role="button"]:has-text("Avançar"), div[role="button"]:has-text("Chat")',
   
   // Profile data
   profileUsername: 'header h2',
@@ -1025,60 +1031,192 @@ export class InstagramHandler extends BasePlatformHandler {
   /**
    * Send a direct message on Instagram
    */
+  private extractThreadIdFromUrl(url: string): string {
+    const match = url.match(/\/direct\/t\/([^/?#]+)/);
+    return match?.[1] || '';
+  }
+
+  private composerSelector(): string {
+    return 'div[contenteditable="true"][role="textbox"]:not([aria-label*="Pesquis" i]):not([aria-label*="Search" i]), textarea[placeholder*="Mensagem" i], textarea[placeholder*="Message" i]';
+  }
+
+  private async dismissIgDialogs(): Promise<void> {
+    const page = await this.getPage();
+    const labels = [
+      'Not Now',
+      'Not now',
+      'Agora não',
+      'Agora Não',
+      'Maybe Later',
+      'Mais tarde',
+    ];
+    for (const label of labels) {
+      const btn = page
+        .locator(
+          `button:has-text("${label}"), div[role="button"]:has-text("${label}")`,
+        )
+        .first();
+      if (await btn.isVisible().catch(() => false)) {
+        await btn.click({ timeout: 2000 }).catch(() => undefined);
+        await page.waitForTimeout(400);
+      }
+    }
+  }
+
+  private async typeAndSendComposer(text: string): Promise<boolean> {
+    const page = await this.getPage();
+    const box = page.locator(this.composerSelector()).last();
+    const appeared = await box
+      .waitFor({ timeout: 12000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!appeared) return false;
+
+    await box.click({ timeout: 5000 });
+    await page.keyboard.insertText(text);
+    let written = ((await box.innerText().catch(() => '')) || '').trim();
+    if (!written) {
+      await box.pressSequentially(text, { delay: 12 });
+      written = ((await box.innerText().catch(() => '')) || '').trim();
+    }
+    if (!written) return false;
+
+    const send = page.locator('[aria-label="Enviar"], [aria-label="Send"]').last();
+    if (await send.waitFor({ timeout: 3000 }).then(() => true).catch(() => false)) {
+      await send.click({ timeout: 5000 });
+    } else {
+      await page.keyboard.press('Enter');
+    }
+    await page.waitForTimeout(900);
+    if (((await box.innerText().catch(() => '')) || '').includes(text)) {
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(700);
+    }
+    return !(((await box.innerText().catch(() => '')) || '').includes(text));
+  }
+
+  private async dmViaNewMessage(username: string, message: string): Promise<boolean> {
+    const page = await this.getPage();
+    await this.navigate(`${this.baseUrl}/direct/new/`);
+    await page.waitForTimeout(1500);
+    await this.dismissIgDialogs();
+
+    const search = page
+      .locator(
+        'input[name="queryBox"], input[placeholder*="Search" i], input[placeholder*="Pesquis" i], input[placeholder*="Buscar" i]',
+      )
+      .first();
+    if (!(await search.waitFor({ timeout: 10000 }).then(() => true).catch(() => false))) {
+      return false;
+    }
+    await search.click({ timeout: 5000 });
+    await search.fill('');
+    await search.pressSequentially(username, { delay: 40 });
+    await page.waitForTimeout(1500);
+
+    const userRow = page
+      .locator(
+        `div[role="dialog"] button:has-text("${username}"), div[role="dialog"] div[role="button"]:has-text("${username}"), div[role="dialog"] span:text-is("${username}")`,
+      )
+      .first();
+    if (await userRow.waitFor({ timeout: 8000 }).then(() => true).catch(() => false)) {
+      await userRow.click({ timeout: 5000 });
+    } else {
+      const fallback = page.locator(`span:text-is("${username}")`).first();
+      if (!(await fallback.waitFor({ timeout: 4000 }).then(() => true).catch(() => false))) {
+        return false;
+      }
+      await fallback.click({ timeout: 5000 });
+    }
+    await page.waitForTimeout(600);
+
+    const next = page
+      .locator(
+        'div[role="button"]:has-text("Chat"), div[role="button"]:has-text("Next"), div[role="button"]:has-text("Avançar"), button:has-text("Chat"), button:has-text("Next")',
+      )
+      .last();
+    if (await next.waitFor({ timeout: 5000 }).then(() => true).catch(() => false)) {
+      await next.click({ timeout: 5000 });
+      await page.waitForTimeout(1200);
+    }
+
+    await this.dismissIgDialogs();
+    return this.typeAndSendComposer(message);
+  }
+
   async dm(payload: DMPayload): Promise<ActionResult> {
     const startTime = Date.now();
     const { allowed, status } = await this.checkAndRecordAction('dm');
+    const username = `${payload.username || ''}`.replace(/^@/, '').trim();
+    const message = `${payload.message || ''}`.trim();
 
     if (!allowed) {
-      return this.createErrorResult('dm', payload.username, 'Rate limit exceeded', startTime, status);
+      return this.createErrorResult('dm', username, 'Rate limit exceeded', startTime, status);
+    }
+    if (!username || !message) {
+      return this.createErrorResult(
+        'dm',
+        username || payload.username,
+        'Username and message required',
+        startTime,
+        status,
+      );
     }
 
     try {
-      log.info('Sending Instagram DM', { username: payload.username });
+      return await this.withPageLock(async () => {
+        log.info('Sending Instagram DM', { username });
+        const page = await this.getPage();
 
-      // Navigate to home first for warm-up browsing
-      await this.navigate(`${this.baseUrl}/`);
-      await this.warmUp({ scrollCount: 3 + Math.floor(Math.random() * 2) });
+        const profileUrl = `${this.baseUrl}/${username}/`;
+        await this.navigate(profileUrl);
+        await this.think();
+        await this.dismissIgDialogs();
 
-      // Navigate to user profile
-      const profileUrl = `${this.baseUrl}/${payload.username}/`;
-      await this.navigate(profileUrl);
-      await this.think();
+        let sent = false;
+        const messageBtn = page.locator(SELECTORS.messageButton).first();
+        if (await messageBtn.waitFor({ timeout: 10000 }).then(() => true).catch(() => false)) {
+          await messageBtn.click({ timeout: 5000 }).catch(async () => {
+            await messageBtn.click({ force: true, timeout: 5000 });
+          });
+          await page.waitForTimeout(1500);
+          await this.dismissIgDialogs();
+          sent = await this.typeAndSendComposer(message);
+        }
 
-      // Click message button
-      if (!(await this.waitForElement(SELECTORS.messageButton, 10000))) {
-        return this.createErrorResult('dm', payload.username, 'Message button not found', startTime, status);
-      }
+        if (!sent) {
+          log.info('Profile Message failed; trying /direct/new/', { username });
+          sent = await this.dmViaNewMessage(username, message);
+        }
 
-      await this.clickHuman(SELECTORS.messageButton);
-      await this.delay();
+        if (!sent) {
+          return this.createErrorResult(
+            'dm',
+            username,
+            'DM input not found',
+            startTime,
+            status,
+          );
+        }
 
-      // Wait for DM input
-      if (!(await this.waitForElement(SELECTORS.dmInput, 10000))) {
-        return this.createErrorResult('dm', payload.username, 'DM input not found', startTime, status);
-      }
+        let threadId = this.extractThreadIdFromUrl(page.url());
+        for (let i = 0; i < 20 && !threadId; i++) {
+          await page.waitForTimeout(500);
+          threadId = this.extractThreadIdFromUrl(page.url());
+        }
 
-      // Type message
-      await this.clickHuman(SELECTORS.dmInput);
-      await this.typeHuman(SELECTORS.dmInput, payload.message);
-      await this.pause();
-
-      // Send message
-      const page = await this.getPage();
-      await page.keyboard.press('Enter');
-      
-      await this.delay();
-      await this.recordAction('dm');
-      
-      log.info('Successfully sent Instagram DM');
-      return this.createResult('dm', payload.username, startTime, status, {
-        profileUrl: `https://instagram.com/${payload.username}`,
-        messagePreview: payload.message,
-        actions: ['✉️ DM Sent'],
+        await this.recordAction('dm');
+        log.info('Successfully sent Instagram DM', { username, threadId });
+        return this.createResult('dm', username, startTime, status, {
+          thread_id: threadId,
+          profileUrl: `https://instagram.com/${username}`,
+          messagePreview: message,
+          actions: ['✉️ DM Sent'],
+        });
       });
     } catch (error) {
       log.error('Error sending Instagram DM', { error: String(error) });
-      return this.createErrorResult('dm', payload.username, String(error), startTime, status);
+      return this.createErrorResult('dm', username, String(error), startTime, status);
     }
   }
 

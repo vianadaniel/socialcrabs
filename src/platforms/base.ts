@@ -93,6 +93,10 @@ export abstract class BasePlatformHandler {
       duration: Date.now() - startTime,
       rateLimit,
     };
+
+    if (details && Object.keys(details).length > 0) {
+      result.data = details;
+    }
     
     // Send notification asynchronously (don't await)
     this.sendNotification('action:complete', result, details);

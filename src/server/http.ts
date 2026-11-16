@@ -230,7 +230,11 @@ export function createHttpServer(socialCrabs: SocialCrabs, apiKey?: string) {
         return;
       }
       const result = await socialCrabs.instagram.dm({ username, message });
-      res.json(result);
+      const data = (result as { data?: Record<string, unknown> }).data || {};
+      res.json({
+        ...result,
+        thread_id: data.thread_id || null,
+      });
     } catch (error) {
       log.error('Error sending Instagram DM', { error: String(error) });
       res.status(500).json({ error: String(error) });
